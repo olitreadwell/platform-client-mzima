@@ -85,6 +85,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     continue-on-error: true
+    # id-token: Workload Identity Federation to Google Cloud for the test data.
+    permissions:
+      id-token: write
+      contents: read
+      packages: read
 
     services:
       mysql:
@@ -132,13 +137,28 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
+      # The test database snapshot is in a private bucket; this workflow reads
+      # it as sa-mzima-ci-test-data through the foundation's Workload Identity
+      # pool (gcp-foundation-app-infra, development stage).
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        id: gcp-auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/384414633675/locations/global/workloadIdentityPools/foundation-pool/providers/foundation-gh-provider
+          service_account: sa-mzima-ci-test-data@prj-d-platform-0eb7.iam.gserviceaccount.com
+          token_format: access_token
+
       ## set up API endpoint
       - name: Setup API endpoint
+        env:
+          GCS_TOKEN: ${{ steps.gcp-auth.outputs.access_token }}
         run: |
           set -ex;
 
-          SNAPSHOT_URL="https://ushahidi-static-web-assets.s3.eu-west-1.amazonaws.com/ushahidi-e2e-data.sql.gz"
-          wget -O sql-snapshot.sql.gz ${SNAPSHOT_URL} 2>/dev/null || { echo "Failed downloading snapshot!" && exit 1; }
+          SNAPSHOT_URL="https://storage.googleapis.com/storage/v1/b/bkt-prj-d-platform-0eb7-ci-test-data/o/ushahidi-e2e-data.sql.gz?alt=media"
+          set +x  # keep the token out of the log
+          curl -sSf -H "Authorization: Bearer ${GCS_TOKEN}" -o sql-snapshot.sql.gz "${SNAPSHOT_URL}" || { echo "Failed downloading snapshot!" && exit 1; }
+          set -x
 
           tmp_defaults=`mktemp`
           echo -e "[client]\nhost=127.0.0.1\nuser=ushahidi\nport=33061\npassword=ushahidi" > $tmp_defaults
@@ -253,18 +273,6 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v1
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v1
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ECR_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_ECR_SECRET_ACCESS_KEY }}
-          aws-region: eu-west-1
-
-      - name: Login to AWS Container Registry
-        uses: docker/login-action@v1
-        with:
-          registry: 513259414768.dkr.ecr.eu-west-1.amazonaws.com
-
       # Artifact Registry in GCP: pushes as sa-platform-ci-push through the
       # foundation's Workload Identity pool. Only pushes need it.
       - name: Authenticate to Google Cloud (Workload Identity Federation)
@@ -296,28 +304,13 @@ jobs:
             type=raw,value={{branch}}-{{sha}},enable=${{ github.ref_type == 'branch' }}
             type=ref,event=tag
 
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v3
-        with:
-          images: |
-            513259414768.dkr.ecr.eu-west-1.amazonaws.com/platform-client-mzima
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=sha
-
-      - name: Build and push to Amazon ECR and Artifact Registry
+      - name: Build and push to Artifact Registry
         uses: docker/build-push-action@v2
         with:
           pull: true
           push: ${{ github.event_name != 'pull_request' }}
-          labels: ${{ steps.meta.outputs.labels }}
-          tags: |
-            ${{ steps.meta.outputs.tags }}
-            ${{ github.event_name != 'pull_request' && steps.meta_gar.outputs.tags || '' }}
+          labels: ${{ steps.meta_gar.outputs.labels }}
+          tags: ${{ github.event_name != 'pull_request' && steps.meta_gar.outputs.tags || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
